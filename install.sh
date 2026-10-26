@@ -1,7 +1,7 @@
 #!/bin/bash
 
-author=233boy
-# github=https://github.com/233boy/sing-box
+author=233boy # upstream attribution; download source is independent below
+# Fork: https://github.com/cetaceang/sing-box
 
 # bash fonts colors
 red='\e[31m'
@@ -12,27 +12,24 @@ blue='\e[94m'
 magenta='\e[95m'
 cyan='\e[96m'
 none='\e[0m'
-_red() { echo -e ${red}$@${none}; }
-_blue() { echo -e ${blue}$@${none}; }
-_cyan() { echo -e ${cyan}$@${none}; }
-_green() { echo -e ${green}$@${none}; }
-_yellow() { echo -e ${yellow}$@${none}; }
-_magenta() { echo -e ${magenta}$@${none}; }
-_red_bg() { echo -e "\e[41m$@${none}"; }
+_red() { echo -e "${red}$*${none}"; }
+_blue() { echo -e "${blue}$*${none}"; }
+_cyan() { echo -e "${cyan}$*${none}"; }
+_green() { echo -e "${green}$*${none}"; }
+_yellow() { echo -e "${yellow}$*${none}"; }
+_magenta() { echo -e "${magenta}$*${none}"; }
+_red_bg() { echo -e "\e[41m$*${none}"; }
 
 is_err=$(_red_bg 错误!)
 is_warn=$(_red_bg 警告!)
 
 err() {
-    echo -e "\n$is_err $@\n" && exit 1
+    echo -e "\n$is_err $*\n" && exit 1
 }
 
 warn() {
-    echo -e "\n$is_warn $@\n"
+    echo -e "\n$is_warn $*\n"
 }
-
-# root
-[[ $EUID != 0 ]] && err "当前非 ${yellow}ROOT用户.${none}"
 
 # apt-get, yum, zypper or apk
 cmd=$(type -P apt-get || type -P yum || type -P zypper || type -P apk)
@@ -70,11 +67,12 @@ is_conf_dir=$is_core_dir/conf
 is_log_dir=/var/log/$is_core
 is_sh_bin=/usr/local/bin/$is_core
 is_sh_dir=$is_core_dir/sh
-is_sh_repo=$author/$is_core
+is_sh_repo=cetaceang/sing-box
 is_pkg="wget tar bash"
 # Alpine: gcompat provides glibc compatibility for prebuilt binaries
 [[ $cmd =~ apk ]] && is_pkg="$is_pkg gcompat jq"
 is_config_json=$is_core_dir/config.json
+is_shell_rc=/root/.bashrc
 tmp_var_lists=(
     tmpcore
     tmpsh
@@ -86,10 +84,8 @@ tmp_var_lists=(
 )
 
 # tmp dir
-tmpdir=$(mktemp -u)
-[[ ! $tmpdir ]] && {
-    tmpdir=/tmp/tmp-$RANDOM
-}
+tmpdir=$(mktemp -d) || err '无法创建临时目录'
+trap 'rm -rf "$tmpdir"' EXIT
 
 # set up var
 for i in ${tmp_var_lists[*]}; do
@@ -101,10 +97,58 @@ load() {
     . $is_sh_dir/src/$1
 }
 
-# wget add --no-check-certificate
+# Always verify HTTPS certificates, especially when downloading executable code.
 _wget() {
     [[ $proxy ]] && export https_proxy=$proxy
-    wget --no-check-certificate $*
+    wget "$@"
+}
+
+# Resolve main once, then download that immutable commit over verified HTTPS.
+# No Release is required, and no upstream fallback is permitted.
+prepare_scripts() {
+    local target=$1 sha entry kind file archive_sha256 archive=$tmpdir/source.tar.gz
+    mkdir -p "$target" || return 1
+    if [[ $local_install ]]; then
+        mkdir -p "$target/src" || return 1
+        cp "$PWD/install.sh" "$PWD/sing-box.sh" "$target/" || return 1
+        cp "$PWD"/src/*.sh "$target/src/" || return 1
+        printf 'repo=%s\nsource=local\n' "$is_sh_repo" >"$target/.source"
+    else
+        sha=$(_wget -qO- "https://api.github.com/repos/$is_sh_repo/commits/main" |
+            sed -n 's/^ *"sha": "\([a-f0-9]*\)",*$/\1/p' | head -n1)
+        [[ $sha =~ ^[a-f0-9]{40}$ ]] || {
+            msg err '无法解析 fork 的 main 提交；未使用其他仓库。'; return 1;
+        }
+        _wget -q -t 3 -O "$archive" "https://codeload.github.com/$is_sh_repo/tar.gz/$sha" || return 1
+        tar -tzf "$archive" >"$tmpdir/archive.list" || return 1
+        while IFS= read -r entry; do
+            [[ $entry == "sing-box-$sha/"* && $entry != *'/../'* && $entry != *'/./'* ]] || return 1
+        done <"$tmpdir/archive.list"
+        tar -tvzf "$archive" >"$tmpdir/archive.types" || return 1
+        while IFS= read -r kind; do
+            [[ $kind == [-d]* ]] || return 1
+        done <"$tmpdir/archive.types"
+        # Extract only the two entry scripts and src/*.sh, never an install tree.
+        while IFS= read -r entry; do
+            file=${entry#"sing-box-$sha/"}
+            case $file in
+                install.sh|sing-box.sh|src/*.sh)
+                    [[ $file != src/*/* ]] || return 1
+                    tar -xzf "$archive" --strip-components=1 -C "$target" "$entry" || return 1 ;;
+            esac
+        done <"$tmpdir/archive.list"
+        printf 'repo=%s\ncommit=%s\n' "$is_sh_repo" "$sha" >"$target/.source"
+        archive_sha256=$(sha256sum "$archive") || return 1
+        printf 'archive_sha256=%s\n' "${archive_sha256%% *}" >>"$target/.source"
+        msg ok "管理脚本来源: $is_sh_repo@$sha"
+    fi
+    for file in "$target"/*.sh "$target"/src/*.sh; do
+        [[ -f $file && ! -L $file ]] && bash -n "$file" || return 1
+    done
+    [[ -f $target/src/manager.sh ]] || return 1
+    # The archive was fetched from the pinned fork commit, not user-supplied URLs.
+    . "$target/src/manager.sh"
+    validate_scripts "$target"
 }
 
 # print a mesage
@@ -129,6 +173,7 @@ show_help() {
     echo -e "Usage: $0 [-f xxx | -l | -p xxx | -v xxx | -h]"
     echo -e "  -f, --core-file <path>          自定义 $is_core_name 文件路径, e.g., -f /root/$is_core-linux-amd64.tar.gz"
     echo -e "  -l, --local-install             本地获取安装脚本, 使用当前目录"
+    echo -e "      --adopt-existing            接管已有 233boy 安装；只更新管理脚本，不重启服务"
     echo -e "  -p, --proxy <addr>              使用代理下载, e.g., -p http://127.0.0.1:2333"
     echo -e "  -v, --core-version <ver>        自定义 $is_core_name 版本, e.g., -v v1.8.13"
     echo -e "  -h, --help                      显示此帮助界面\n"
@@ -177,11 +222,8 @@ download() {
         is_ok=$is_core_ok
         ;;
     sh)
-        link=https://github.com/${is_sh_repo}/releases/latest/download/code.tar.gz
-        name="$is_core_name 脚本"
-        tmpfile=$tmpsh
-        is_ok=$is_sh_ok
-        ;;
+        prepare_scripts "$tmpdir/scripts" && touch "$is_sh_ok"
+        return ;;
     jq)
         link=https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-$is_arch
         name="jq"
@@ -269,6 +311,10 @@ pass_args() {
             local_install=1
             shift 1
             ;;
+        --adopt-existing)
+            adopt_existing=1
+            shift
+            ;;
         -p | --proxy)
             [[ -z $2 ]] && {
                 err "($1) 缺少必需参数, 正确使用示例: [$1 http://127.0.0.1:2333 or -p socks5://127.0.0.1:2333]"
@@ -287,7 +333,7 @@ pass_args() {
             show_help
             ;;
         *)
-            echo -e "\n${is_err} ($@) 为未知参数...\n"
+            echo -e "\n${is_err} ($*) 为未知参数...\n"
             show_help
             ;;
         esac
@@ -295,6 +341,9 @@ pass_args() {
     [[ $is_core_ver && $is_core_file ]] && {
         err "无法同时自定义 ${is_core_name} 版本和 ${is_core_name} 文件."
     }
+    [[ $adopt_existing && ( $is_core_ver || $is_core_file ) ]] &&
+        err '--adopt-existing 不允许更换内核版本或文件。'
+    return 0
 }
 
 # exit and remove tmpdir
@@ -307,24 +356,29 @@ exit_and_del_tmpdir() {
         echo
         exit 1
     }
-    exit
+    exit 0
 }
 
 # main
-main() {
-
+install_main() {
+    # Parse before the old-install guard: adoption never enters fresh installation.
+    [[ $# -eq 0 ]] || pass_args "$@"
+    if [[ $adopt_existing ]]; then
+        command -v jq >/dev/null && command -v wget >/dev/null ||
+            err '接管需要已安装的 jq 和 wget；请先手动安装依赖。'
+        prepare_scripts "$tmpdir/scripts" || err '准备 fork 管理脚本失败，原安装未改动。'
+        replace_scripts "$tmpdir/scripts" || err '接管失败；请查看上述原因和备份。'
+        return 0
+    fi
     # check old version
-    [[ -f $is_sh_bin && -d $is_core_dir/bin && -d $is_sh_dir && -d $is_conf_dir ]] && {
-        err "检测到脚本已安装, 如需重装请使用${green} ${is_core} reinstall ${none}命令."
+    [[ -e $is_core_dir || -e $is_sh_bin || -L $is_sh_bin ]] && {
+        err "检测到已有安装或目录；安全接管请显式使用 --adopt-existing。"
     }
-
-    # check parameters
-    [[ $# -gt 0 ]] && pass_args $@
 
     # show welcome msg
     clear
     echo
-    echo "........... $is_core_name script by $author .........."
+    echo "........... $is_core_name cetaceang fork (upstream $author) .........."
     echo
 
     # start installing...
@@ -340,7 +394,8 @@ main() {
     }
     # local dir install sh script
     [[ $local_install ]] && {
-        >$is_sh_ok
+        prepare_scripts "$tmpdir/scripts" || err '本地管理脚本检查失败'
+        >"$is_sh_ok"
         msg warn "${yellow}本地获取安装脚本 > $PWD ${none}"
     }
 
@@ -405,11 +460,7 @@ main() {
     mkdir -p $is_sh_dir
 
     # copy sh file or unzip sh zip file.
-    if [[ $local_install ]]; then
-        cp -rf $PWD/* $is_sh_dir
-    else
-        tar zxf $is_sh_ok -C $is_sh_dir
-    fi
+    cp -a "$tmpdir/scripts/." "$is_sh_dir/" || err '复制管理脚本失败'
 
     # create core bin dir
     mkdir -p $is_core_dir/bin
@@ -421,18 +472,18 @@ main() {
     fi
 
     # add alias
-    echo "alias sb=$is_sh_bin" >>/root/.bashrc
-    echo "alias $is_core=$is_sh_bin" >>/root/.bashrc
+    echo "alias sb=$is_sh_bin" >>"$is_shell_rc"
+    echo "alias $is_core=$is_sh_bin" >>"$is_shell_rc"
 
     # core command
     ln -sf $is_sh_dir/$is_core.sh $is_sh_bin
-    ln -sf $is_sh_dir/$is_core.sh ${is_sh_bin/$is_core/sb}
+    ln -sf "$is_sh_dir/$is_core.sh" "${is_sh_bin%/*}/sb"
 
     # jq
-    [[ $jq_not_found ]] && mv -f $is_jq_ok /usr/bin/jq
+    [[ $jq_not_found ]] && { mv -f "$is_jq_ok" /usr/bin/jq && chmod +x /usr/bin/jq; }
 
     # chmod
-    chmod +x $is_core_bin $is_sh_bin /usr/bin/jq ${is_sh_bin/$is_core/sb}
+    chmod +x "$is_core_bin" "$is_sh_bin" "${is_sh_bin%/*}/sb"
 
     # create log dir
     mkdir -p $is_log_dir
@@ -448,6 +499,7 @@ main() {
     # create condf dir
     mkdir -p $is_conf_dir
 
+    load manager.sh
     load core.sh
     # create a reality config
     add reality
@@ -458,4 +510,7 @@ main() {
 }
 
 # start.
-main $@
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    [[ $EUID == 0 ]] || err "当前非 ${yellow}ROOT用户.${none}"
+    install_main "$@"
+fi

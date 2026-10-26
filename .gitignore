@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+code.tar.gz
+SHA256SUMS

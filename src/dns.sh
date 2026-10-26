@@ -8,6 +8,7 @@ is_dns_list=(
     none
 )
 dns_set() {
+    local candidate
     if [[ $(echo -e "1.11.99\n$is_core_ver" | sort -V | head -n1) == '1.11.99' ]]; then
         is_dns_new=1
     fi
@@ -39,7 +40,7 @@ dns_set() {
             is_dns_use=none
             ;;
         *)
-            err "无法识别 DNS 参数: $@"
+            err "无法识别 DNS 参数: $*"
             ;;
         esac
     else
@@ -51,15 +52,16 @@ dns_set() {
     fi
     is_dns_use_bak=$is_dns_use
     if [[ $is_dns_use == "none" ]]; then
-        cat <<<$(jq '.|.dns={}|del(.route.default_domain_resolver)' $is_config_json) >$is_config_json
+        candidate=$(jq '.|.dns={}|del(.route.default_domain_resolver)' "$is_config_json") || return 1
     else
         if [[ $is_dns_new ]]; then
             dns_set_server $is_dns_use
-            cat <<<$(jq '.|.dns.servers=[{tag:"dns",type:"'$is_dns_type'",server:"'$is_dns_use'",domain_resolver:"local"},{tag:"local",type:"local"}]|.route.default_domain_resolver="dns"' $is_config_json) >$is_config_json
+            candidate=$(jq '.|.dns.servers=[{tag:"dns",type:"'$is_dns_type'",server:"'$is_dns_use'",domain_resolver:"local"},{tag:"local",type:"local"}]|.route.default_domain_resolver="dns"' "$is_config_json") || return 1
         else
-            cat <<<$(jq '.dns.servers=[{address:"'$is_dns_use'",address_resolver:"local"},{tag:"local",address:"local"}]' $is_config_json) >$is_config_json
+            candidate=$(jq '.dns.servers=[{address:"'$is_dns_use'",address_resolver:"local"},{tag:"local",address:"local"}]' "$is_config_json") || return 1
         fi
     fi
+    commit_config "$is_config_json" "$candidate" || return 1
     manage restart &
     msg "\n已更新 DNS 为: $(_green $is_dns_use_bak)\n"
 }

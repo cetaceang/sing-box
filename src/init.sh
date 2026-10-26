@@ -1,7 +1,7 @@
 #!/bin/bash
 
-author=233boy
-# github=https://github.com/233boy/sing-box
+author=233boy # upstream attribution, not the download repository
+# Fork: https://github.com/cetaceang/sing-box
 
 # bash fonts colors
 red='\e[31m'
@@ -13,13 +13,13 @@ magenta='\e[95m'
 cyan='\e[96m'
 none='\e[0m'
 
-_red() { echo -e ${red}$@${none}; }
-_blue() { echo -e ${blue}$@${none}; }
-_cyan() { echo -e ${cyan}$@${none}; }
-_green() { echo -e ${green}$@${none}; }
-_yellow() { echo -e ${yellow}$@${none}; }
-_magenta() { echo -e ${magenta}$@${none}; }
-_red_bg() { echo -e "\e[41m$@${none}"; }
+_red() { echo -e "${red}$*${none}"; }
+_blue() { echo -e "${blue}$*${none}"; }
+_cyan() { echo -e "${cyan}$*${none}"; }
+_green() { echo -e "${green}$*${none}"; }
+_yellow() { echo -e "${yellow}$*${none}"; }
+_magenta() { echo -e "${magenta}$*${none}"; }
+_red_bg() { echo -e "\e[41m$*${none}"; }
 
 _rm() {
     rm -rf "$@"
@@ -38,13 +38,13 @@ is_err=$(_red_bg 错误!)
 is_warn=$(_red_bg 警告!)
 
 err() {
-    echo -e "\n$is_err $@\n"
+    echo -e "\n$is_err $*\n"
     [[ $is_dont_auto_exit ]] && return
     exit 1
 }
 
 warn() {
-    echo -e "\n$is_warn $@\n"
+    echo -e "\n$is_warn $*\n"
 }
 
 # load bash script.
@@ -52,10 +52,10 @@ load() {
     . $is_sh_dir/src/$1
 }
 
-# wget add --no-check-certificate
+# Verify HTTPS certificates for all downloads.
 _wget() {
     # [[ $proxy ]] && export https_proxy=$proxy
-    wget --no-check-certificate "$@"
+    wget "$@"
 }
 
 # apt-get, yum, zypper or apk
@@ -83,7 +83,7 @@ is_conf_dir=$is_core_dir/conf
 is_log_dir=/var/log/$is_core
 is_sh_bin=/usr/local/bin/$is_core
 is_sh_dir=$is_core_dir/sh
-is_sh_repo=$author/$is_core
+is_sh_repo=cetaceang/sing-box
 is_pkg="wget unzip tar qrencode bash"
 is_config_json=$is_core_dir/config.json
 is_caddy_bin=/usr/local/bin/caddy
@@ -143,6 +143,7 @@ if [[ -f $is_caddy_bin && -d $is_caddy_dir && $is_caddy_service ]]; then
     fi
 fi
 
+load manager.sh
 load core.sh
-[[ ! $args ]] && args=main
-main $args
+[[ $# -gt 0 ]] || set -- main
+main "$@"

@@ -1,11 +1,11 @@
 show_help() {
     case $1 in
     api | x25519 | tls | run | uuid | version)
-        $is_core_bin help $1 ${@:2}
+        "$is_core_bin" help "$1" "${@:2}"
         ;;
     *)
         [[ $1 ]] && warn "未知选项 '$1'"
-        msg "$is_core_name script $is_sh_ver by $author"
+        msg "$is_core_name script $is_sh_ver (cetaceang fork; upstream $author)"
         msg "Usage: $is_core [options]... [args]... "
         msg
         help_info=(
@@ -36,6 +36,8 @@ show_help() {
             # "   type [name] [type | auto]                       更改伪装类型"
             "   method [name] [method | auto]                   更改加密方式"
             "   sni [name] [ ip | domain]                       更改 serverName"
+            "   handshake [name] [server] [port]               更改 REALITY handshake（独立于 SNI）"
+            "   add reality|rh2 [port] [uuid|auto] [sni] [handshake-server] [handshake-port]"
             # "   seed [name] [seed | auto]                       更改 mKCP seed"
             "   new [name] [...]                                更改协议"
             "   web [name] [domain]                             更改伪装网站\n"
@@ -72,23 +74,15 @@ show_help() {
         done
         msg "谨慎使用 del, ddel, 此选项会直接删除配置; 无需确认"
         msg "反馈问题) $(msg_ul https://github.com/${is_sh_repo}/issues) "
-        msg "文档(doc) $(msg_ul https://233boy.com/$is_core/$is_core-script/)"
+        msg "文档(doc) $(msg_ul https://github.com/$is_sh_repo#readme)"
         ;;
 
     esac
 }
 
 about() {
-    ####### 要点13脸吗只会改我链接的小人 #######
-    unset c n m s b
-    msg
-    msg "网站: $(msg_ul https://233boy.com)"
-    msg "频道: $(msg_ul https://t.me/tg2333)"
-    msg "群组: $(msg_ul https://t.me/tg233boy)"
-    msg "Github: $(msg_ul https://github.com/${is_sh_repo})"
-    msg "Twitter: $(msg_ul https://twitter.com/ai233boy)"
+    msg "Fork: $(msg_ul https://github.com/$is_sh_repo)"
+    msg "Upstream: $(msg_ul https://github.com/233boy/sing-box) (author: $author)"
     msg "$is_core_name site: $(msg_ul https://sing-box.sagernet.org/)"
-    msg "$is_core_name core: $(msg_ul https://github.com/${is_core_repo})"
-    msg
-    ####### 要点13脸吗只会改我链接的小人 #######
+    msg "$is_core_name core: $(msg_ul https://github.com/$is_core_repo)"
 }

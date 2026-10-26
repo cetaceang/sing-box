@@ -68,6 +68,7 @@ info_list=(
     "用户名 (Username)"
     "跳过证书验证 (allowInsecure)"
     "拥塞控制算法 (congestion_control)"
+    "REALITY handshake"
 )
 change_list=(
     "更改协议"
@@ -83,6 +84,7 @@ change_list=(
     "更改 SNI (serverName)"
     "更改伪装网站"
     "更改用户名 (Username)"
+    "更改 REALITY handshake"
 )
 servername_list=(
     www.amazon.com
@@ -115,7 +117,7 @@ msg() {
 }
 
 msg_ul() {
-    echo -e "\e[4m$@\e[0m"
+    echo -e "\e[4m$*\e[0m"
 }
 
 # pause
@@ -227,7 +229,7 @@ ask() {
         is_tmp_list=(${protocol_list[@]})
         [[ $is_no_auto_tls ]] && {
             unset is_tmp_list
-            for v in ${protocol_list[@]}; do
+            for v in "${protocol_list[@]}"; do
                 [[ $(grep -i "\-tls$" <<<$v) ]] && is_tmp_list=(${is_tmp_list[@]} $v)
             done
         }
@@ -236,7 +238,7 @@ ask() {
         ;;
     set_change_list)
         is_tmp_list=()
-        for v in ${is_can_change[@]}; do
+        for v in "${is_can_change[@]}"; do
             is_tmp_list+=("${change_list[$v]}")
         done
         is_opt_msg="\n请选择更改:\n"
@@ -333,6 +335,7 @@ create() {
         # get json
         [[ $is_change || ! $json_str ]] && get protocol $2
         [[ $net == "reality" ]] && is_add_public_key=",outbounds:[{type:\"direct\"},{tag:\"public_key_$is_public_key\",type:\"direct\"}]"
+        is_add_public_key=${is_add_public_key:-}
         is_new_json=$(jq "{inbounds:[{tag:\"$is_config_name\",type:\"$is_protocol\",$is_listen,listen_port:$port,$json_str}]$is_add_public_key}" <<<{})
         [[ $is_test_json ]] && return # tmp test
         # only show json, dont save to file.
@@ -342,10 +345,19 @@ create() {
             msg
             return
         }
-        # del old file
-        [[ $is_config_file ]] && is_no_del_msg=1 && del $is_config_file
-        # save json to file
-        cat <<<$is_new_json >$is_json_file
+        # Keep every unedited field (extra users, short IDs, sniffing, routing,
+        # TLS options and top-level extension fields) on same-protocol changes.
+        if [[ $is_change && $is_config_file && $is_change_id != 0 ]]; then
+            preserve_config || return 1
+        elif [[ $is_change && $is_reality && $is_private_key && $is_handshake_json ]]; then
+            is_new_json=$(jq --argjson handshake "$is_handshake_json" \
+                '.inbounds[0].tls.reality.handshake = $handshake' <<<"$is_new_json") || return 1
+        fi
+        if [[ $is_new_install ]]; then
+            printf '%s\n' "$is_new_json" >"$is_json_file" || return 1
+        else
+            commit_config "$is_json_file" "$is_new_json" "${is_config_file:+$is_conf_dir/$is_config_file}" || return 1
+        fi
         if [[ $is_new_install ]]; then
             # config.json
             create config.json
@@ -388,7 +400,13 @@ create() {
         fi
         is_outbounds='outbounds:[{tag:"direct",type:"direct"}]'
         is_server_config_json=$(jq "{$is_log,$is_dns,$is_ntp$is_outbounds}" <<<{})
-        cat <<<$is_server_config_json >$is_config_json
+        if [[ $is_new_install ]]; then
+            printf '%s\n' "$is_server_config_json" >"$is_config_json" || return 1
+        else
+            # Existing main config may contain user DNS/routes/subscriptions.
+            is_server_config_json=$(jq '.' "$is_config_json") || return 1
+            commit_config "$is_config_json" "$is_server_config_json" || return 1
+        fi
         manage restart &
         ;;
     esac
@@ -436,6 +454,9 @@ change() {
         sni | servername | servernames)
             is_change_id=10
             ;;
+        handshake)
+            is_change_id=13
+            ;;
         web | proxy-site)
             is_change_id=11
             ;;
@@ -446,9 +467,9 @@ change() {
         esac
     fi
     [[ $is_try_change ]] && return
-    [[ $is_dont_auto_exit ]] && {
-        get info $1
-    } || {
+    if [[ $is_dont_auto_exit ]]; then
+        get info "$1" || return 1
+    else
         [[ $is_change_id ]] && {
             is_change_msg=${change_list[$is_change_id]}
             [[ $is_change_id == 'full' ]] && {
@@ -456,9 +477,9 @@ change() {
             }
             [[ $is_change_msg ]] && _green "\n快速执行: $is_change_msg"
         }
-        info $1
+        info "$1" || return 1
         [[ $is_auto_get_config ]] && msg "\n自动选择: $is_config_file"
-    }
+    fi
     is_old_net=$net
     [[ $is_tcp_http ]] && net=http
     [[ $host ]] && net=$is_protocol-$net-tls
@@ -474,12 +495,17 @@ change() {
     }
     case $is_change_id in
     full)
-        add $net ${@:3}
+        if [[ ! $3 ]]; then
+            # A valid legacy JSON needs no regeneration. Keep even formatting.
+            check_current_config || { manager_error '配置检查失败；原文件保持不变。'; return 1; }
+        else
+            add "$net" "${@:3}"
+        fi
         ;;
     0)
         # new protocol
         is_set_new_protocol=1
-        add ${@:3}
+        add "${@:3}"
         ;;
     1)
         # new port
@@ -589,22 +615,7 @@ change() {
             if [[ $is_new_private_key == $is_new_public_key ]]; then
                 err "Private key 和 Public key 不能一样."
             fi
-            is_tmp_json=$is_conf_dir/$is_config_file-$uuid
-            cp -f $is_conf_dir/$is_config_file $is_tmp_json
-            sed -i s#$is_private_key #$is_new_private_key# $is_tmp_json
-            $is_core_bin check -c $is_tmp_json &>/dev/null
-            if [[ $? != 0 ]]; then
-                is_key_err=1
-                is_key_err_msg="Private key 无法通过测试."
-            fi
-            sed -i s#$is_new_private_key #$is_new_public_key# $is_tmp_json
-            $is_core_bin check -c $is_tmp_json &>/dev/null
-            if [[ $? != 0 ]]; then
-                is_key_err=1
-                is_key_err_msg+="Public key 无法通过测试."
-            fi
-            rm $is_tmp_json
-            [[ $is_key_err ]] && err $is_key_err_msg
+            # The complete candidate is checked transactionally before commit.
             is_private_key=$is_new_private_key
             is_public_key=$is_new_public_key
             is_test_json=
@@ -646,6 +657,9 @@ change() {
         [[ ! $is_socks_user ]] && err "($is_config_file) 不支持更改用户名 (Username)."
         ask string is_socks_user "请输入新用户名 (Username):"
         add $net
+        ;;
+    13)
+        change_handshake "${@:3}"
         ;;
     esac
 }
@@ -696,7 +710,7 @@ uninstall() {
     fi
     manage stop &>/dev/null
     manage disable &>/dev/null
-    rm -rf $is_core_dir $is_log_dir $is_sh_bin ${is_sh_bin/$is_core/sb}
+    rm -rf $is_core_dir $is_log_dir $is_sh_bin "${is_sh_bin%/*}/sb"
     if [[ $is_systemd ]]; then
         rm -f /lib/systemd/system/$is_core.service
     elif [[ $is_openrc ]]; then
@@ -823,7 +837,7 @@ add() {
             is_new_protocol=Socks
             ;;
         *)
-            for v in ${protocol_list[@]}; do
+            for v in "${protocol_list[@]}"; do
                 [[ $(grep -E -i "^$is_lower$" <<<$v) ]] && is_new_protocol=$v && break
             done
 
@@ -866,7 +880,9 @@ add() {
         is_use_port=$2
         is_use_uuid=$3
         is_use_servername=$4
-        is_add_opts="[port] [uuid] [sni]"
+        is_use_handshake_server=$5
+        is_use_handshake_port=$6
+        is_add_opts="[port] [uuid] [sni] [handshake-server] [handshake-port]"
         ;;
     shadowsocks)
         is_use_port=$2
@@ -927,7 +943,7 @@ add() {
 
     # prefer args.
     if [[ $2 ]]; then
-        for v in is_use_port is_use_uuid is_use_host is_use_path is_use_pass is_use_method is_use_door_addr is_use_door_port; do
+        for v in is_use_port is_use_uuid is_use_host is_use_path is_use_pass is_use_method is_use_door_addr is_use_door_port is_use_servername is_use_handshake_server is_use_handshake_port; do
             [[ ${!v} == 'auto' ]] && unset $v
         done
 
@@ -960,14 +976,14 @@ add() {
         fi
         if [[ $is_use_method ]]; then
             is_tmp_use_name=加密方式
-            is_tmp_list=${ss_method_list[@]}
-            for v in ${is_tmp_list[@]}; do
+            is_tmp_list=("${ss_method_list[@]}")
+            for v in "${is_tmp_list[@]}"; do
                 [[ $(grep -E -i "^${is_use_method}$" <<<$v) ]] && is_tmp_use_type=$v && break
             done
             [[ ! ${is_tmp_use_type} ]] && {
                 warn "(${is_use_method}) 不是一个可用的${is_tmp_use_name}."
                 msg "${is_tmp_use_name}可用如下: "
-                for v in ${is_tmp_list[@]}; do
+                for v in "${is_tmp_list[@]}"; do
                     msg "\t\t$v"
                 done
                 msg "$is_err_tips\n"
@@ -981,6 +997,26 @@ add() {
         [[ $is_use_servername ]] && is_servername=$is_use_servername
         [[ $is_use_socks_user ]] && is_socks_user=$is_use_socks_user
         [[ $is_use_socks_pass ]] && is_socks_pass=$is_use_socks_pass
+    fi
+
+    if [[ $is_reality ]]; then
+        [[ $is_servername ]] || is_servername=$is_random_servername
+        if [[ $is_main_start && ! $is_change && ! $is_new_install && ! $is_use_servername ]]; then
+            read -r -p "REALITY SNI [$is_servername]: " is_use_servername
+            is_servername=${is_use_servername:-$is_servername}
+        fi
+        is_handshake_server=${is_use_handshake_server:-${is_handshake_server:-$is_servername}}
+        is_handshake_port=${is_use_handshake_port:-${is_handshake_port:-443}}
+        if [[ $is_main_start && ! $is_change && ! $is_new_install && ! $is_use_handshake_server && ! $is_use_handshake_port ]]; then
+            ask_handshake || return 1
+        fi
+        valid_handshake "$is_handshake_server" "$is_handshake_port" || {
+            manager_error 'handshake 地址或端口无效（端口范围 1–65535）。'; return 1;
+        }
+        [[ $is_handshake_json ]] || is_handshake_json='{}'
+        is_handshake_json=$(jq -cn --argjson old "$is_handshake_json" \
+            --arg server "$is_handshake_server" --argjson port "$is_handshake_port" \
+            '$old | .server=$server | .server_port=$port') || return 1
     fi
 
     # anytls with domain (ACME TLS)
@@ -1000,7 +1036,7 @@ add() {
                 get_port
                 is_https_port=$tmp_port
                 warn "端口 (80 或 443) 已经被占用, 你也可以考虑使用 no-auto-tls"
-                msg "\e[41m no-auto-tls 帮助(help)\e[0m: $(msg_ul https://233boy.com/$is_core/no-auto-tls/)\n"
+                msg "\e[41m no-auto-tls 帮助(help)\e[0m: $(msg_ul https://github.com/$is_sh_repo#readme)\n"
                 msg "\n Caddy 将使用非标准端口实现自动配置 TLS, HTTP:$is_http_port HTTPS:$is_https_port\n"
                 msg "请确定是否继续???"
                 pause
@@ -1072,7 +1108,7 @@ add() {
     fi
 
     # create json
-    create server $is_new_protocol
+    create server "$is_new_protocol" || return 1
 
     # show config info.
     info
@@ -1110,7 +1146,10 @@ get() {
     info)
         get file $2
         if [[ $is_config_file ]]; then
-            is_json_str=$(cat $is_conf_dir/"$is_config_file" | sed s#//.*##)
+            is_json_str=$(jq -c . "$is_conf_dir/$is_config_file") || {
+                manager_error "无法读取 JSON: $is_config_file"; return 1;
+            }
+            unset is_reality is_handshake_json is_handshake_server is_handshake_port is_add_public_key is_anytls_domain
             is_json_data=$(jq '(.inbounds[0]|.type,.listen_port,(.users[0]|.uuid,.password,.username),.method,.password,.override_port,.override_address,(.transport|.type,.path,.headers.host),(.tls|.server_name,.reality.private_key)),(.outbounds[1].tag)' <<<$is_json_str)
             [[ $? != 0 ]] && err "无法读取此文件: $is_config_file"
             is_up_var_set=(null is_protocol port uuid password username ss_method ss_password door_port door_addr net_type path host is_servername is_private_key is_public_key)
@@ -1121,12 +1160,15 @@ get() {
                 [[ $is_debug ]] && msg "$i-${is_up_var_set[$i]}: $v"
                 export ${is_up_var_set[$i]}="${v}"
             done
-            for v in ${is_up_var_set[@]}; do
+            for v in "${is_up_var_set[@]}"; do
                 [[ ${!v} == 'null' ]] && unset $v
             done
 
             if [[ $is_private_key ]]; then
                 is_reality=1
+                is_handshake_json=$(jq -c '.inbounds[0].tls.reality.handshake // {}' <<<"$is_json_str")
+                is_handshake_server=$(jq -r '.server // empty' <<<"$is_handshake_json")
+                is_handshake_port=$(jq -r '.server_port // 443' <<<"$is_handshake_json")
                 net_type+=reality
                 is_public_key=${is_public_key/public_key_/}
             fi
@@ -1249,7 +1291,10 @@ get() {
             net=reality
             [[ ! $is_servername ]] && is_servername=$is_random_servername
             [[ ! $is_private_key ]] && get_pbk
-            is_json_add="tls:{enabled:true,server_name:\"$is_servername\",reality:{enabled:true,handshake:{server:\"$is_servername\",server_port:443},private_key:\"$is_private_key\",short_id:[\"\"]}}"
+            if [[ ! $is_handshake_json ]]; then
+                is_handshake_json=$(jq -cn --arg server "$is_servername" '{server:$server,server_port:443}') || return 1
+            fi
+            is_json_add="tls:{enabled:true,server_name:\"$is_servername\",reality:{enabled:true,handshake:$is_handshake_json,private_key:\"$is_private_key\",short_id:[\"\"]}}"
             [[ $is_lower =~ "http" ]] && {
                 is_json_add="$is_json_add,transport:{type:\"http\"}"
             } || {
@@ -1357,7 +1402,7 @@ get() {
 # show info
 info() {
     if [[ ! $is_protocol ]]; then
-        get info $1
+        get info "$1" || return 1
     fi
     # is_color=$(shuf -i 41-45 -n1)
     is_color=44
@@ -1433,7 +1478,7 @@ info() {
         ;;
     reality)
         is_color=41
-        is_can_change=(0 1 5 9 10)
+        is_can_change=(0 1 5 9 10 13)
         is_info_show=(0 1 2 3 15 4 8 16 17 18)
         is_flow=xtls-rprx-vision
         is_net_type=tcp
@@ -1442,7 +1487,8 @@ info() {
             is_net_type=h2
             is_info_show=(${is_info_show[@]/15/})
         }
-        is_info_str=($is_protocol $is_addr $port $uuid $is_flow $is_net_type reality $is_servername chrome $is_public_key)
+        is_info_show+=(22)
+        is_info_str=($is_protocol $is_addr $port $uuid $is_flow $is_net_type reality $is_servername chrome $is_public_key "${is_handshake_server:-$is_servername}:${is_handshake_port:-443}")
         is_url="$is_protocol://$uuid@$is_addr:$port?encryption=none&security=reality&flow=$is_flow&type=$is_net_type&sni=$is_servername&pbk=$is_public_key&fp=chrome#233boy-$net-$is_addr"
         ;;
     anytls)
@@ -1482,7 +1528,7 @@ info() {
         msg "$a $tt= \e[${is_color}m${is_info_str[$i]}\e[0m"
     done
     if [[ $is_new_install ]]; then
-        warn "首次安装请查看脚本帮助文档: $(msg_ul https://233boy.com/$is_core/$is_core-script/)"
+        warn "首次安装请查看脚本帮助文档: $(msg_ul https://github.com/$is_sh_repo#readme)"
     fi
     if [[ $is_url ]]; then
         msg "------------- ${info_list[12]} -------------"
@@ -1495,7 +1541,7 @@ info() {
         msg "------------- no-auto-tls INFO -------------"
         msg "端口(port): $port"
         msg "路径(path): $path"
-        msg "\e[41m帮助(help)\e[0m: $(msg_ul https://233boy.com/$is_core/no-auto-tls/)"
+        msg "\e[41m帮助(help)\e[0m: $(msg_ul https://github.com/$is_sh_repo#readme)"
     fi
     footer_msg
 }
@@ -1504,13 +1550,8 @@ info() {
 footer_msg() {
     [[ $is_core_stop && ! $is_new_json ]] && warn "$is_core_name 当前处于停止状态."
     [[ $is_caddy_stop && $host ]] && warn "Caddy 当前处于停止状态."
-    ####### 要点13脸吗只会改我链接的小人 #######
-    unset c n m s b
     msg "------------- END -------------"
-    msg "关注(tg): $(msg_ul https://t.me/tg2333)"
-    msg "文档(doc): $(msg_ul https://233boy.com/$is_core/$is_core-script/)"
-    msg "推广(ads): 机场推荐($is_core_name services): $(msg_ul https://g${c}e${n}t${m}j${s}m${b}s.com/)\n"
-    ####### 要点13脸吗只会改我链接的小人 #######
+    msg "文档(doc): $(msg_ul https://github.com/$is_sh_repo#readme)\n"
 }
 
 # URL or qrcode
@@ -1523,7 +1564,6 @@ url_qr() {
             msg "\n\e[${is_color}m${is_url}\e[0m\n"
             footer_msg
         } || {
-            link="https://233boy.github.io/tools/qr.html#${is_url}"
             msg "\n------------- $is_config_name & QR code 二维码 -------------"
             msg
             if [[ $(type -P qrencode) ]]; then
@@ -1532,8 +1572,6 @@ url_qr() {
                 msg "请安装 qrencode: $(_green "$cmd update -y; $cmd install qrencode -y")"
             fi
             msg
-            msg "如果无法正常显示或识别, 请使用下面的链接来生成二维码:"
-            msg "\n\e[4;${is_color}m${link}\e[0m\n"
             footer_msg
         }
     else
@@ -1547,6 +1585,11 @@ url_qr() {
 
 # update core, sh, caddy
 update() {
+    if [[ $1 == 2 || $1 == sh ]]; then
+        [[ ! $2 ]] || { manager_error '脚本使用 fork 的 main 提交更新，不接受内核/上游 Release 版本号。'; return 1; }
+        bash "$is_sh_dir/install.sh" --adopt-existing
+        return $?
+    fi
     case $1 in
     1 | core | $is_core)
         is_update_name=core
@@ -1596,9 +1639,9 @@ update() {
 
 # main menu; if no prefer args.
 is_main_menu() {
-    msg "\n------------- $is_core_name script $is_sh_ver by $author -------------"
+    msg "\n------------- $is_core_name script $is_sh_ver (cetaceang fork; upstream $author) -------------"
     msg "$is_core_name $is_core_ver: $is_core_status"
-    msg "群组(Chat): $(msg_ul https://t.me/tg233boy)"
+    msg "仓库: $(msg_ul https://github.com/$is_sh_repo)"
     is_main_start=1
     ask mainmenu
     case $REPLY in
@@ -1669,15 +1712,15 @@ main() {
     a | add | gen | no-auto-tls)
         [[ $1 == 'gen' ]] && is_gen=1
         [[ $1 == 'no-auto-tls' ]] && is_no_auto_tls=1
-        add ${@:2}
+        add "${@:2}"
         ;;
     bin | pbk | check | completion | format | generate | geoip | geosite | merge | rule-set | run | tools)
         is_run_command=$1
         if [[ $1 == 'bin' ]]; then
-            $is_core_bin ${@:2}
+            "$is_core_bin" "${@:2}"
         else
             [[ $is_run_command == 'pbk' ]] && is_run_command="generate reality-keypair"
-            $is_core_bin $is_run_command ${@:2}
+            "$is_core_bin" $is_run_command "${@:2}"
         fi
         ;;
     bbr)
@@ -1685,7 +1728,7 @@ main() {
         _try_enable_bbr
         ;;
     c | config | change)
-        change ${@:2}
+        change "${@:2}"
         ;;
     # client | genc)
     #     create client $2
@@ -1704,20 +1747,16 @@ main() {
             return
             ;;
         fix-all)
-            is_dont_auto_exit=1
-            msg
-            for v in $(ls $is_conf_dir | grep .json$ | sed '/dynamic-port-.*-link/d'); do
-                msg "fix: $v"
-                change $v full
-            done
-            _green "\nfix 完成.\n"
+            check_current_config || { manager_error '配置检查失败；所有原文件保持不变。'; return 1; }
+            _green "\nfix-all 检查通过；全部已有字段已保留。\n"
+            return 0
             ;;
         *)
             is_dont_auto_exit=1
             [[ ! $2 ]] && {
                 err "无法找到需要删除的参数"
             } || {
-                for v in ${@:2}; do
+                for v in "${@:2}"; do
                     del $v
                 done
             }
@@ -1729,7 +1768,7 @@ main() {
         ;;
     dns)
         load dns.sh
-        dns_set ${@:2}
+        dns_set "${@:2}"
         ;;
     debug)
         is_debug=1
@@ -1764,7 +1803,7 @@ main() {
         log_set $2
         ;;
     url | qr)
-        url_qr $@
+        url_qr "$@"
         ;;
     un | uninstall)
         uninstall
@@ -1780,7 +1819,7 @@ main() {
         update $is_update_name $is_update_ver
         ;;
     ssss | ss2022)
-        get $@
+        get "$@"
         ;;
     s | status)
         msg "\n$is_core_name $is_core_ver: $is_core_status\n"
@@ -1809,18 +1848,18 @@ main() {
         ;;
     h | help | --help)
         load help.sh
-        show_help ${@:2}
+        show_help "${@:2}"
         ;;
     *)
         is_try_change=1
         change test $1
         if [[ $is_change_id ]]; then
             unset is_try_change
-            [[ $2 ]] && {
-                change $2 $1 ${@:3}
-            } || {
+            if [[ $2 ]]; then
+                change "$2" "$1" "${@:3}"
+            else
                 change
-            }
+            fi
         else
             err "无法识别 ($1), 获取帮助请使用: $is_core help"
         fi

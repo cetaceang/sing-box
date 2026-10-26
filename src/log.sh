@@ -10,12 +10,13 @@ is_log_level_list=(
     del
 )
 log_set() {
+    local candidate
     if [[ $1 ]]; then
-        for v in ${is_log_level_list[@]}; do
+        for v in "${is_log_level_list[@]}"; do
             [[ $(grep -E -i "^${1,,}$" <<<$v) ]] && is_log_level_use=$v && break
         done
         [[ ! $is_log_level_use ]] && {
-            err "无法识别 log 参数: $@ \n请使用 $is_core log [${is_log_level_list[@]}] 进行相关设定.\n备注: del 参数仅临时删除 log 文件; none 参数将不会生成 log 文件."
+            err "无法识别 log 参数: $* \n请使用 $is_core log [${is_log_level_list[*]}] 进行相关设定.\n备注: del 参数仅临时删除 log 文件; none 参数将不会生成 log 文件."
         }
         case $is_log_level_use in
         del)
@@ -23,14 +24,17 @@ log_set() {
             msg "\n $(_green 已临时删除 log 文件, 如果你想要完全禁止生成 log 文件请使用: $is_core log none)\n"
             ;;
         none)
-            rm -rf $is_log_dir/*.log
-            cat <<<$(jq '.log={"disabled":true}' $is_config_json) >$is_config_json
+            candidate=$(jq '.log={"disabled":true}' "$is_config_json") || return 1
             ;;
         *)
-            cat <<<$(jq '.log={output:"/var/log/'$is_core'/access.log",level:"'$is_log_level_use'","timestamp":true}' $is_config_json) >$is_config_json
+            candidate=$(jq '.log={output:"/var/log/'$is_core'/access.log",level:"'$is_log_level_use'","timestamp":true}' "$is_config_json") || return 1
             ;;
         esac
 
+        if [[ $is_log_level_use != del ]]; then
+            commit_config "$is_config_json" "$candidate" || return 1
+            [[ $is_log_level_use != none ]] || rm -f "$is_log_dir"/*.log
+        fi
         manage restart &
         [[ $1 != 'del' ]] && msg "\n已更新 Log 设定为: $(_green $is_log_level_use)\n"
     else
